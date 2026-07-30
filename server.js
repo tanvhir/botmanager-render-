@@ -24,6 +24,7 @@ app.use(express.json());
 // Store schedules in memory (in production, use a database)
 let activeSchedules = [];
 let scheduledTasks = new Map();
+let executionHistory = [];
 
 // API endpoint to receive schedule
 app.post('/api/schedule', async (req, res) => {
@@ -111,7 +112,18 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'healthy',
         activeSchedules: activeSchedules.length,
-        scheduledTasks: scheduledTasks.size
+        scheduledTasks: scheduledTasks.size,
+        executionHistoryCount: executionHistory.length
+    });
+});
+
+// Get execution history
+app.get('/api/execution-history', (req, res) => {
+    const limit = parseInt(req.query.limit) || 50;
+    const history = executionHistory.slice(-limit).reverse();
+    res.json({
+        total: executionHistory.length,
+        history: history
     });
 });
 
@@ -163,11 +175,32 @@ async function setupScheduleExecution(schedule) {
 
 // Execute a single bot at its scheduled time
 async function executeSingleBot(bot, dateStr, daySchedule) {
+    const executionRecord = {
+        botName: bot.name,
+        cycleDate: dateStr,
+        executionTime: daySchedule.executionTime,
+        studyHours: daySchedule.formatted,
+        status: 'pending',
+        timestamp: new Date().toISOString(),
+        error: null
+    };
+
     try {
         await logStudyHours(bot, dateStr, daySchedule.studyMinutes, daySchedule.formatted);
+        executionRecord.status = 'success';
         console.log(`  ✓ ${bot.name}: ${daySchedule.formatted} at ${daySchedule.executionTime}`);
     } catch (error) {
+        executionRecord.status = 'failed';
+        executionRecord.error = error.message;
         console.error(`  ✗ ${bot.name} failed:`, error.message);
+    }
+
+    // Add to execution history
+    executionHistory.push(executionRecord);
+
+    // Keep only last 1000 execution records
+    if (executionHistory.length > 1000) {
+        executionHistory = executionHistory.slice(-1000);
     }
 }
 
