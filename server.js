@@ -124,39 +124,36 @@ async function setupScheduleExecution(schedule) {
 
     // Create individual jobs for each bot on each day at their specific execution time
     for (const botData of schedule.bots) {
-        for (const [dateStr, daySchedule] of Object.entries(botData.schedule)) {
-            if (!daySchedule.shouldStudy || !daySchedule.executionTime) {
+        for (const [cycleDate, daySchedule] of Object.entries(botData.schedule)) {
+            if (!daySchedule.shouldStudy || !daySchedule.executionTime || !daySchedule.executionDate) {
                 continue;
             }
 
             // Parse the execution time (in BD time = UTC+6)
             const [hours, minutes] = daySchedule.executionTime.split(':').map(Number);
 
-            // Create execution date in BD time
-            const executionDateBD = new Date(dateStr);
+            // Use executionDate (when Render should execute) instead of cycleDate
+            const executionDateBD = new Date(daySchedule.executionDate);
             executionDateBD.setHours(hours, minutes, 0, 0);
-
-            // Handle case where time is early morning (before 5 AM) - this belongs to the previous day's cycle
-            // Since StreakUp day is 5 AM to next 5 AM, times before 5 AM should be treated as part of the previous date
-            // But for scheduling purposes, we use the date as provided in the schedule
 
             // Convert BD time to UTC (subtract 6 hours)
             const executionDateUTC = new Date(executionDateBD.getTime() - (TIMEZONE_OFFSET * 60 * 60 * 1000));
 
             // Only schedule if the execution time is in the future
             if (executionDateUTC <= new Date()) {
-                console.log(`  ⊘ Skipping ${botData.bot.name} on ${dateStr} at ${daySchedule.executionTime} BD - execution time has passed`);
+                console.log(`  ⊘ Skipping ${botData.bot.name} - execution time has passed`);
                 continue;
             }
 
             // Schedule the job in UTC
             const job = scheduleJob(executionDateUTC, async () => {
-                console.log(`🚀 Executing ${botData.bot.name} at ${daySchedule.executionTime} BD (${executionDateUTC.toISOString()} UTC) on ${dateStr}`);
-                await executeSingleBot(botData.bot, dateStr, daySchedule);
+                console.log(`🚀 Executing ${botData.bot.name} at ${daySchedule.executionTime} BD (${executionDateUTC.toISOString()} UTC)`);
+                console.log(`   Cycle Date (5 AM Rule): ${cycleDate}`);
+                await executeSingleBot(botData.bot, cycleDate, daySchedule);
             });
 
             tasks.push(job);
-            console.log(`  ✓ Scheduled ${botData.bot.name} for ${dateStr} at ${daySchedule.executionTime} BD (${executionDateUTC.toISOString()} UTC)`);
+            console.log(`  ✓ Scheduled ${botData.bot.name} for ${daySchedule.executionDate} at ${daySchedule.executionTime} BD (${executionDateUTC.toISOString()} UTC)`);
         }
     }
 
