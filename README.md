@@ -5,8 +5,9 @@ This server receives bot schedules from the Bot Manager and automatically execut
 ## Features
 
 - **Schedule Reception**: Accepts multi-day bot behavior schedules via REST API
-- **Automated Execution**: Uses cron jobs to execute scheduled tasks at specific times
-- **Realistic Timing**: Random delays between bot executions for natural behavior
+- **Precise Time Scheduling**: Executes each bot at their specific random execution time
+- **Timezone Support**: Built-in support for Bangladesh time (UTC+6)
+- **Realistic Timing**: Random execution times within specified ranges for natural behavior
 - **Health Monitoring**: Endpoints to check active schedules and server status
 
 ## Environment Variables
@@ -108,13 +109,32 @@ Health check endpoint.
 
 ## How It Works
 
-1. **Schedule Reception**: The Bot Manager sends a complete schedule for multiple days
-2. **Task Scheduling**: The server creates cron jobs for each day at 06:00 UTC
-3. **Execution**: At the scheduled time, the server:
-   - Signs in as each bot user
+1. **Schedule Reception**: The Bot Manager sends a complete schedule with specific execution times for each bot/day
+2. **Time Conversion**: Execution times (in BD time = UTC+6) are converted to UTC for scheduling
+3. **Task Scheduling**: The server creates individual scheduled jobs for each bot at their specific execution time
+4. **Execution**: At the scheduled time, the server:
+   - Signs in as the bot user
    - Logs the scheduled study hours to Supabase
-   - Signs out and moves to the next bot with random delays
-4. **Completion**: After all bots are processed, the day's execution is complete
+   - Signs out
+5. **Completion**: Each bot executes independently at their assigned random time
+
+## Time-Based Scheduling
+
+The system supports realistic timing control:
+
+- **Execution Time Range**: Set start and end times (e.g., 7:00 AM to 3:00 PM BD time)
+- **Random Times**: Each bot gets a random execution time within the range for each day
+- **Timezone Support**: All times are in Bangladesh time (UTC+6) and automatically converted to UTC
+- **Individual Scheduling**: Each bot has its own execution time, not all executing at once
+
+**Example Schedule:**
+```
+Bot 1: 7:00 AM on Day 1, 8:30 AM on Day 2, 9:15 AM on Day 3...
+Bot 2: 7:45 AM on Day 1, 10:00 AM on Day 2, 2:30 PM on Day 3...
+Bot 3: 8:15 AM on Day 1, 11:30 AM on Day 2, 1:00 PM on Day 3...
+```
+
+This creates realistic, staggered entry times that mimic natural user behavior.
 
 ## Behavior Patterns
 

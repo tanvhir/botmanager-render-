@@ -1,11 +1,15 @@
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const cron = require('node-cron');
+const { scheduleJob, scheduledJobs } = require('node-schedule');
 const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Timezone configuration (BD time = UTC+6)
+const TIMEZONE_OFFSET = 6; // hours ahead of UTC
+const TIMEZONE = 'Asia/Dhaka';
 
 // Supabase configuration
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://nilltdjafpxgqgetbhzs.supabase.co';
@@ -111,67 +115,63 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Setup schedule execution with cron jobs
+// Setup schedule execution with precise times
 async function setupScheduleExecution(schedule) {
     const tasks = [];
     const startDate = new Date(schedule.startDate);
 
-    console.log(`⏰ Setting up execution for schedule ${schedule.id}`);
+    console.log(`⏰ Setting up execution for schedule ${schedule.id} (Timezone: ${TIMEZONE})`);
 
-    // Create a cron job for each day
-    for (let dayIndex = 0; dayIndex < schedule.days; dayIndex++) {
-        const currentDate = new Date(startDate);
-        currentDate.setDate(currentDate.getDate() + dayIndex);
-        const dateStr = currentDate.toISOString().split('T')[0];
+    // Create individual jobs for each bot on each day at their specific execution time
+    for (const botData of schedule.bots) {
+        for (const [dateStr, daySchedule] of Object.entries(botData.schedule)) {
+            if (!daySchedule.shouldStudy || !daySchedule.executionTime) {
+                continue;
+            }
 
-        // Schedule execution at 6:00 AM for each day
-        const cronExpression = `0 6 ${currentDate.getDate()} ${currentDate.getMonth() + 1} *`;
+            // Parse the execution time (in BD time = UTC+6)
+            const [hours, minutes] = daySchedule.executionTime.split(':').map(Number);
 
-        const task = cron.schedule(cronExpression, async () => {
-            console.log(`🚀 Executing schedule for ${dateStr}`);
-            await executeDaySchedule(schedule, dateStr, dayIndex);
-        }, {
-            scheduled: true,
-            timezone: 'UTC'
-        });
+            // Create execution date in BD time
+            const executionDateBD = new Date(dateStr);
+            executionDateBD.setHours(hours, minutes, 0, 0);
 
-        tasks.push(task);
-        console.log(`  ✓ Scheduled task for ${dateStr} at 06:00 UTC`);
+            // Handle case where time is early morning (before 5 AM) - this belongs to the previous day's cycle
+            // Since StreakUp day is 5 AM to next 5 AM, times before 5 AM should be treated as part of the previous date
+            // But for scheduling purposes, we use the date as provided in the schedule
+
+            // Convert BD time to UTC (subtract 6 hours)
+            const executionDateUTC = new Date(executionDateBD.getTime() - (TIMEZONE_OFFSET * 60 * 60 * 1000));
+
+            // Only schedule if the execution time is in the future
+            if (executionDateUTC <= new Date()) {
+                console.log(`  ⊘ Skipping ${botData.bot.name} on ${dateStr} at ${daySchedule.executionTime} BD - execution time has passed`);
+                continue;
+            }
+
+            // Schedule the job in UTC
+            const job = scheduleJob(executionDateUTC, async () => {
+                console.log(`🚀 Executing ${botData.bot.name} at ${daySchedule.executionTime} BD (${executionDateUTC.toISOString()} UTC) on ${dateStr}`);
+                await executeSingleBot(botData.bot, dateStr, daySchedule);
+            });
+
+            tasks.push(job);
+            console.log(`  ✓ Scheduled ${botData.bot.name} for ${dateStr} at ${daySchedule.executionTime} BD (${executionDateUTC.toISOString()} UTC)`);
+        }
     }
 
     scheduledTasks.set(schedule.id, tasks);
+    console.log(`✓ Total ${tasks.length} tasks scheduled for schedule ${schedule.id}`);
 }
 
-// Execute schedule for a specific day
-async function executeDaySchedule(schedule, dateStr, dayIndex) {
-    console.log(`📊 Executing ${schedule.bots.length} bot tasks for ${dateStr}`);
-
-    let successCount = 0;
-    let failCount = 0;
-
-    for (const botData of schedule.bots) {
-        const bot = botData.bot;
-        const daySchedule = botData.schedule[dateStr];
-
-        if (!daySchedule || !daySchedule.shouldStudy) {
-            console.log(`  ⊘ Skipping ${bot.name} (not scheduled)`);
-            continue;
-        }
-
-        try {
-            await logStudyHours(bot, dateStr, daySchedule.studyMinutes, daySchedule.formatted);
-            successCount++;
-            console.log(`  ✓ ${bot.name}: ${daySchedule.formatted}`);
-        } catch (error) {
-            failCount++;
-            console.error(`  ✗ ${bot.name} failed:`, error.message);
-        }
-
-        // Random delay between bot executions for realism
-        await new Promise(resolve => setTimeout(resolve, Math.random() * 5000 + 2000));
+// Execute a single bot at its scheduled time
+async function executeSingleBot(bot, dateStr, daySchedule) {
+    try {
+        await logStudyHours(bot, dateStr, daySchedule.studyMinutes, daySchedule.formatted);
+        console.log(`  ✓ ${bot.name}: ${daySchedule.formatted} at ${daySchedule.executionTime}`);
+    } catch (error) {
+        console.error(`  ✗ ${bot.name} failed:`, error.message);
     }
-
-    console.log(`📈 Execution complete for ${dateStr}: ${successCount} success, ${failCount} failed`);
 }
 
 // Log study hours for a bot
