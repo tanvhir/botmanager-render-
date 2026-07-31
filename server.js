@@ -11,11 +11,16 @@ const PORT = process.env.PORT || 3000;
 const TIMEZONE_OFFSET = 6; // hours ahead of UTC
 const TIMEZONE = 'Asia/Dhaka';
 
-// Supabase configuration
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://nilltdjafpxgqgetbhzs.supabase.co';
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5pbGx0ZGphZnB4Z3FnZXRiaHpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ5OTY4MTIsImV4cCI6MjEwMDU3MjgxMn0.BNe9WOeyt4qhk_xaiwekgOzy4bU8rSKX_dJK-WRBLfo';
+// StreakUp Supabase configuration (original app)
+const STREAKUP_SUPABASE_URL = process.env.STREAKUP_SUPABASE_URL || 'https://nilltdjafpxgqgetbhzs.supabase.co';
+const STREAKUP_SUPABASE_ANON_KEY = process.env.STREAKUP_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5pbGx0ZGphZnB4Z3FnZXRiaHpzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ5OTY4MTIsImV4cCI6MjEwMDU3MjgxMn0.BNe9WOeyt4qhk_xaiwekgOzy4bU8rSKX_dJK-WRBLfo';
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Bot Manager Supabase configuration
+const BOT_MANAGER_SUPABASE_URL = process.env.BOT_MANAGER_SUPABASE_URL || 'https://nalpunvxaskrlkpilzcn.supabase.co';
+const BOT_MANAGER_SUPABASE_ANON_KEY = process.env.BOT_MANAGER_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5hbHB1bnZ4YXNrcmxrcGlsemNuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0NzUyMzMsImV4cCI6MjEwMTA1MTIzM30.WxuUFArPmukenk8mYctya3PcGr87DFn7uPFRIdqkG8I';
+
+const streakupSupabase = createClient(STREAKUP_SUPABASE_URL, STREAKUP_SUPABASE_ANON_KEY);
+const botManagerSupabase = createClient(BOT_MANAGER_SUPABASE_URL, BOT_MANAGER_SUPABASE_ANON_KEY);
 
 // Middleware
 app.use(cors());
@@ -25,6 +30,102 @@ app.use(express.json());
 let activeSchedules = [];
 let scheduledTasks = new Map();
 let executionHistory = [];
+
+// Fetch all active schedules from bot-manager DB on startup
+async function recoverSchedulesFromDB() {
+    try {
+        console.log('🔄 Recovering schedules from bot-manager database...');
+        
+        // Fetch all active schedules
+        const { data: schedules, error: schedulesError } = await botManagerSupabase
+            .from('bot_manager_schedules')
+            .select('*')
+            .eq('status', 'active');
+        
+        if (schedulesError) throw schedulesError;
+        
+        if (!schedules || schedules.length === 0) {
+            console.log('✓ No active schedules found in database');
+            return;
+        }
+        
+        console.log(`📋 Found ${schedules.length} active schedules in database`);
+        
+        // Fetch all pending executions for these schedules
+        const scheduleIds = schedules.map(s => s.id);
+        const { data: executions, error: execError } = await botManagerSupabase
+            .from('bot_manager_scheduled_executions')
+            .select('*')
+            .in('schedule_id', scheduleIds)
+            .eq('status', 'pending');
+        
+        if (execError) throw execError;
+        
+        console.log(`📋 Found ${executions?.length || 0} pending executions`);
+        
+        // Fetch bot details
+        const botIds = [...new Set(executions?.map(e => e.bot_id) || [])];
+        const { data: bots, error: botsError } = await botManagerSupabase
+            .from('bot_manager_bots')
+            .select('*')
+            .in('id', botIds);
+        
+        if (botsError) throw botsError;
+        
+        // Reconstruct schedules in memory format
+        for (const schedule of schedules) {
+            const scheduleExecutions = executions?.filter(e => e.schedule_id === schedule.id) || [];
+            const scheduleBots = [];
+            
+            for (const bot of bots || []) {
+                const botExecutions = scheduleExecutions.filter(e => e.bot_id === bot.id);
+                if (botExecutions.length > 0) {
+                    const botSchedule = {};
+                    botExecutions.forEach(exec => {
+                        botSchedule[exec.scheduled_date] = {
+                            shouldStudy: true,
+                            executionDate: exec.scheduled_date,
+                            executionTime: '09:00', // Default time, can be configured
+                            studyMinutes: (bot.target_hours_per_day || 6) * 60,
+                            formatted: `${bot.target_hours_per_day || 6}h`,
+                            executionId: exec.id // Store execution ID for status updates
+                        };
+                    });
+                    
+                    scheduleBots.push({
+                        bot: {
+                            id: bot.id,
+                            name: bot.name,
+                            email: bot.email,
+                            password: bot.password
+                        },
+                        schedule: botSchedule
+                    });
+                }
+            }
+            
+            if (scheduleBots.length > 0) {
+                const scheduleWithId = {
+                    id: schedule.id,
+                    startDate: schedule.start_date,
+                    endDate: schedule.end_date,
+                    bots: scheduleBots,
+                    receivedAt: schedule.created_at,
+                    status: 'active',
+                    fromDB: true
+                };
+                
+                activeSchedules.push(scheduleWithId);
+                await setupScheduleExecution(scheduleWithId);
+                console.log(`✓ Recovered schedule: ${schedule.name}`);
+            }
+        }
+        
+        console.log(`✓ Successfully recovered ${activeSchedules.length} schedules`);
+    } catch (error) {
+        console.error('❌ Error recovering schedules:', error);
+    }
+}
 
 // API endpoint to receive schedule
 app.post('/api/schedule', async (req, res) => {
@@ -127,6 +228,153 @@ app.get('/api/execution-history', (req, res) => {
     });
 });
 
+// API endpoint to fetch pending executions from bot-manager DB
+app.get('/api/bot-manager/pending-executions', async (req, res) => {
+    try {
+        const today = new Date().toISOString().split('T')[0];
+        
+        const { data: executions, error } = await botManagerSupabase
+            .from('bot_manager_scheduled_executions')
+            .select('*')
+            .eq('status', 'pending')
+            .lte('scheduled_date', today)
+            .order('scheduled_date', { ascending: true });
+        
+        if (error) throw error;
+        
+        // Fetch bot details
+        const botIds = [...new Set(executions?.map(e => e.bot_id) || [])];
+        const { data: bots, error: botsError } = await botManagerSupabase
+            .from('bot_manager_bots')
+            .select('*')
+            .in('id', botIds);
+        
+        if (botsError) throw botsError;
+        
+        // Enrich with bot details
+        const enrichedData = (executions || []).map(exec => {
+            const bot = bots?.find(b => b.id === exec.bot_id);
+            return {
+                ...exec,
+                bot_name: bot ? bot.name : 'Unknown',
+                bot_email: bot ? bot.email : null,
+                bot_password: bot ? bot.password : null,
+                target_hours: bot ? bot.target_hours_per_day : 6
+            };
+        });
+        
+        res.json({ success: true, data: enrichedData });
+    } catch (error) {
+        console.error('Error fetching pending executions:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// API endpoint to update execution status in bot-manager DB
+app.post('/api/bot-manager/update-execution', async (req, res) => {
+    try {
+        const { executionId, status, result } = req.body;
+        
+        if (!executionId || !status) {
+            return res.status(400).json({ success: false, error: 'Missing required fields' });
+        }
+        
+        // Update execution status
+        const { error } = await botManagerSupabase
+            .from('bot_manager_scheduled_executions')
+            .update({
+                status: status,
+                executed_at: new Date().toISOString(),
+                result: result || {}
+            })
+            .eq('id', executionId);
+        
+        if (error) throw error;
+        
+        // Fetch execution details for history
+        const { data: exec, error: execError } = await botManagerSupabase
+            .from('bot_manager_scheduled_executions')
+            .select('*')
+            .eq('id', executionId)
+            .single();
+        
+        if (execError) throw execError;
+        
+        // Add to executions history
+        const { data: bot, error: botError } = await botManagerSupabase
+            .from('bot_manager_bots')
+            .select('*')
+            .eq('id', exec.bot_id)
+            .single();
+        
+        if (botError) throw botError;
+        
+        await botManagerSupabase
+            .from('bot_manager_executions')
+            .insert([{
+                bot_id: exec.bot_id,
+                bot_name: bot ? bot.name : 'Unknown',
+                study_hours: result?.hours || 0,
+                status: status,
+                timestamp: new Date().toISOString()
+            }]);
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error updating execution status:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// API endpoint to get all schedules from bot-manager DB
+app.get('/api/bot-manager/schedules', async (req, res) => {
+    try {
+        const { data: schedules, error: schedulesError } = await botManagerSupabase
+            .from('bot_manager_schedules')
+            .select('*')
+            .eq('status', 'active');
+        
+        if (schedulesError) throw schedulesError;
+        
+        const scheduleIds = (schedules || []).map(s => s.id);
+        const { data: executions, error: execError } = await botManagerSupabase
+            .from('bot_manager_scheduled_executions')
+            .select('*')
+            .in('schedule_id', scheduleIds)
+            .eq('status', 'pending');
+        
+        if (execError) throw execError;
+        
+        const botIds = [...new Set(executions?.map(e => e.bot_id) || [])];
+        const { data: bots, error: botsError } = await botManagerSupabase
+            .from('bot_manager_bots')
+            .select('*')
+            .in('id', botIds);
+        
+        if (botsError) throw botsError;
+        
+        const enrichedExecutions = (executions || []).map(exec => {
+            const bot = bots?.find(b => b.id === exec.bot_id);
+            return {
+                ...exec,
+                bot_name: bot ? bot.name : 'Unknown',
+                bot_email: bot ? bot.email : null,
+                bot_password: bot ? bot.password : null,
+                target_hours: bot ? bot.target_hours_per_day : 6
+            };
+        });
+        
+        res.json({
+            success: true,
+            schedules: schedules || [],
+            executions: enrichedExecutions
+        });
+    } catch (error) {
+        console.error('Error fetching schedules:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // Setup schedule execution with precise times
 async function setupScheduleExecution(schedule) {
     const tasks = [];
@@ -189,10 +437,25 @@ async function executeSingleBot(bot, dateStr, daySchedule) {
         await logStudyHours(bot, dateStr, daySchedule.studyMinutes, daySchedule.formatted);
         executionRecord.status = 'success';
         console.log(`  ✓ ${bot.name}: ${daySchedule.formatted} at ${daySchedule.executionTime}`);
+        
+        // Update status in bot-manager DB if this is a DB-recovered schedule
+        if (daySchedule.executionId) {
+            await updateBotManagerExecutionStatus(daySchedule.executionId, 'success', {
+                hours: daySchedule.formatted,
+                minutes: daySchedule.studyMinutes
+            });
+        }
     } catch (error) {
         executionRecord.status = 'failed';
         executionRecord.error = error.message;
         console.error(`  ✗ ${bot.name} failed:`, error.message);
+        
+        // Update status in bot-manager DB if this is a DB-recovered schedule
+        if (daySchedule.executionId) {
+            await updateBotManagerExecutionStatus(daySchedule.executionId, 'failed', {
+                error: error.message
+            });
+        }
     }
 
     // Add to execution history
@@ -204,12 +467,32 @@ async function executeSingleBot(bot, dateStr, daySchedule) {
     }
 }
 
+// Update execution status in bot-manager DB
+async function updateBotManagerExecutionStatus(executionId, status, result) {
+    try {
+        const { error } = await botManagerSupabase
+            .from('bot_manager_scheduled_executions')
+            .update({
+                status: status,
+                executed_at: new Date().toISOString(),
+                result: result || {}
+            })
+            .eq('id', executionId);
+        
+        if (error) throw error;
+        
+        console.log(`  ✓ Updated execution status in bot-manager DB: ${executionId} -> ${status}`);
+    } catch (error) {
+        console.error(`  ✗ Failed to update execution status in bot-manager DB:`, error.message);
+    }
+}
+
 // Log study hours for a bot
 async function logStudyHours(bot, cycleDate, studyMinutes, formatted) {
     const now = new Date().toISOString();
 
     // Sign in as the bot user
-    const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+    const { data: signInData, error: signInError } = await streakupSupabase.auth.signInWithPassword({
         email: bot.email,
         password: bot.password
     });
@@ -219,7 +502,7 @@ async function logStudyHours(bot, cycleDate, studyMinutes, formatted) {
     }
 
     // Check if log exists for the date
-    const { data: existingLog } = await supabase
+    const { data: existingLog } = await streakupSupabase
         .from('study_logs')
         .select('*')
         .eq('user_id', bot.id)
@@ -228,7 +511,7 @@ async function logStudyHours(bot, cycleDate, studyMinutes, formatted) {
 
     if (existingLog) {
         // Update existing log
-        await supabase
+        await streakupSupabase
             .from('study_logs')
             .update({
                 study_minutes: studyMinutes,
@@ -238,7 +521,7 @@ async function logStudyHours(bot, cycleDate, studyMinutes, formatted) {
             .eq('id', existingLog.id);
     } else {
         // Create new log
-        await supabase
+        await streakupSupabase
             .from('study_logs')
             .insert({
                 id: `log_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -252,13 +535,16 @@ async function logStudyHours(bot, cycleDate, studyMinutes, formatted) {
     }
 
     // Sign out
-    await supabase.auth.signOut();
+    await streakupSupabase.auth.signOut();
 }
 
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`🤖 Bot Scheduler Server running on port ${PORT}`);
     console.log(`📡 Ready to receive schedules`);
+    
+    // Recover schedules from database on startup
+    await recoverSchedulesFromDB();
 });
 
 // Graceful shutdown
