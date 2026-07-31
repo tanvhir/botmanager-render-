@@ -162,6 +162,28 @@ app.post('/api/schedule', async (req, res) => {
 
         activeSchedules.push(scheduleWithId);
 
+        // Save schedule to bot manager database
+        try {
+            const { error: dbError } = await botManagerSupabase
+                .from('bot_manager_schedules')
+                .insert({
+                    id: scheduleId,
+                    name: `Schedule ${new Date().toISOString().split('T')[0]}`,
+                    schedule_data: scheduleWithId,
+                    status: 'active',
+                    start_date: schedule.startDate,
+                    end_date: schedule.endDate
+                });
+
+            if (dbError) {
+                console.error('⚠️ Failed to save schedule to database:', dbError);
+            } else {
+                console.log('✓ Schedule saved to bot manager database');
+            }
+        } catch (dbError) {
+            console.error('⚠️ Database error:', dbError);
+        }
+
         // Setup cron jobs for each day
         await setupScheduleExecution(scheduleWithId);
 
@@ -197,7 +219,7 @@ app.get('/api/schedules', (req, res) => {
 });
 
 // Delete a schedule
-app.delete('/api/schedules/:id', (req, res) => {
+app.delete('/api/schedules/:id', async (req, res) => {
     const { id } = req.params;
     
     // Cancel all tasks for this schedule
@@ -210,27 +232,138 @@ app.delete('/api/schedules/:id', (req, res) => {
     // Remove from active schedules
     activeSchedules = activeSchedules.filter(s => s.id !== id);
 
+    // Delete from bot manager database
+    try {
+        const { error: dbError } = await botManagerSupabase
+            .from('bot_manager_schedules')
+            .delete()
+            .eq('id', id);
+
+        if (dbError) {
+            console.error('⚠️ Failed to delete schedule from database:', dbError);
+        } else {
+            console.log('✓ Schedule deleted from bot manager database');
+        }
+    } catch (dbError) {
+        console.error('⚠️ Database error:', dbError);
+    }
+
     res.json({ success: true, message: 'Schedule deleted' });
 });
 
 // Health check
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'healthy',
-        activeSchedules: activeSchedules.length,
-        scheduledTasks: scheduledTasks.size,
-        executionHistoryCount: executionHistory.length
-    });
+app.get('/health', async (req, res) => {
+    try {
+        // Get execution count from database
+        const { count, error: countError } = await botManagerSupabase
+            .from('bot_manager_executions')
+            .select('*', { count: 'exact', head: true });
+
+        const executionCount = countError ? executionHistory.length : (count || 0);
+
+        res.json({
+            status: 'healthy',
+            activeSchedules: activeSchedules.length,
+            scheduledTasks: scheduledTasks.size,
+            executionHistoryCount: executionCount,
+            recovered: true // Indicate that recovery is enabled
+        });
+    } catch (error) {
+        // Fallback to in-memory count if database fails
+        res.json({
+            status: 'healthy',
+            activeSchedules: activeSchedules.length,
+            scheduledTasks: scheduledTasks.size,
+            executionHistoryCount: executionHistory.length,
+            recovered: true
+        });
+    }
 });
 
 // Get execution history
-app.get('/api/execution-history', (req, res) => {
+app.get('/api/execution-history', async (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
-    const history = executionHistory.slice(-limit).reverse();
-    res.json({
-        total: executionHistory.length,
-        history: history
-    });
+
+    try {
+        const { data: executions, error } = await botManagerSupabase
+            .from('bot_manager_executions')
+            .select('*')
+            .order('timestamp', { ascending: false })
+            .limit(limit);
+
+        if (error) throw error;
+
+        const history = executions.map(exec => ({
+            botName: exec.bot_name,
+            cycleDate: exec.cycle_date,
+            executionTime: exec.execution_time,
+            studyHours: exec.study_hours,
+            status: exec.status,
+            timestamp: exec.timestamp,
+            errorMessage: exec.error_message
+        }));
+
+        res.json({
+            total: history.length,
+            history: history
+        });
+    } catch (error) {
+        console.error('Error fetching execution history:', error);
+        // Fallback to in-memory history
+        const history = executionHistory.slice(-limit).reverse();
+        res.json({
+            total: executionHistory.length,
+            history: history
+        });
+    }
+});
+
+// Get upcoming executions
+app.get('/api/upcoming-executions', async (req, res) => {
+    try {
+        const upcoming = [];
+        const now = new Date();
+
+        activeSchedules.forEach(schedule => {
+            if (schedule.bots) {
+                schedule.bots.forEach(botSchedule => {
+                    if (botSchedule.schedule) {
+                        Object.entries(botSchedule.schedule).forEach(([date, data]) => {
+                            if (data.shouldStudy && data.executionTime && data.executionDate) {
+                                const [hours, minutes] = data.executionTime.split(':').map(Number);
+                                const executionDateTime = new Date(data.executionDate);
+                                executionDateTime.setHours(hours, minutes, 0, 0);
+                                
+                                if (executionDateTime > now) {
+                                    upcoming.push({
+                                        botName: botSchedule.bot.name,
+                                        executionTime: data.executionTime,
+                                        executionDate: data.executionDate,
+                                        studyHours: data.formatted,
+                                        executionDateTime: executionDateTime
+                                    });
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        });
+
+        // Sort by execution date/time
+        upcoming.sort((a, b) => a.executionDateTime - b.executionDateTime);
+
+        res.json({
+            total: upcoming.length,
+            upcoming: upcoming.slice(0, 20) // Limit to 20
+        });
+    } catch (error) {
+        console.error('Error fetching upcoming executions:', error);
+        res.json({
+            total: 0,
+            upcoming: []
+        });
+    }
 });
 
 // API endpoint to fetch pending executions from bot-manager DB
@@ -484,6 +617,28 @@ async function executeSingleBot(bot, dateStr, daySchedule) {
     if (executionHistory.length > 1000) {
         executionHistory = executionHistory.slice(-1000);
     }
+
+    // Save execution to bot manager database
+    try {
+        const { error: dbError } = await botManagerSupabase
+            .from('bot_manager_executions')
+            .insert({
+                bot_id: bot.id,
+                bot_name: executionRecord.botName,
+                cycle_date: executionRecord.cycleDate,
+                execution_time: executionRecord.executionTime,
+                study_hours: executionRecord.studyHours,
+                status: executionRecord.status,
+                timestamp: executionRecord.timestamp,
+                error_message: executionRecord.error
+            });
+
+        if (dbError) {
+            console.error('⚠️ Failed to save execution to database:', dbError);
+        }
+    } catch (dbError) {
+        console.error('⚠️ Database error:', dbError);
+    }
 }
 
 // Update execution status in bot-manager DB
@@ -561,6 +716,7 @@ async function logStudyHours(bot, cycleDate, studyMinutes, formatted) {
 app.listen(PORT, async () => {
     console.log(`🤖 Bot Scheduler Server running on port ${PORT}`);
     console.log(`📡 Ready to receive schedules`);
+    console.log(`🔄 Auto-recovery from database: ENABLED`);
     
     // Recover schedules from database on startup
     await recoverSchedulesFromDB();
