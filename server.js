@@ -82,13 +82,18 @@ async function recoverSchedulesFromDB() {
                 if (botExecutions.length > 0) {
                     const botSchedule = {};
                     botExecutions.forEach(exec => {
+                        // Use target_hours from execution entry if available, otherwise use bot's default
+                        const targetHours = exec.target_hours || (bot.target_hours_per_day || 6);
+                        const shouldStudy = exec.behavior !== 'miss';
+                        
                         botSchedule[exec.scheduled_date] = {
-                            shouldStudy: true,
+                            shouldStudy: shouldStudy,
                             executionDate: exec.scheduled_date,
                             executionTime: '09:00', // Default time, can be configured
-                            studyMinutes: (bot.target_hours_per_day || 6) * 60,
-                            formatted: `${bot.target_hours_per_day || 6}h`,
-                            executionId: exec.id // Store execution ID for status updates
+                            studyMinutes: targetHours * 60,
+                            formatted: `${targetHours}h`,
+                            executionId: exec.id, // Store execution ID for status updates
+                            behavior: exec.behavior || 'continue'
                         };
                     });
                     
@@ -385,7 +390,20 @@ async function setupScheduleExecution(schedule) {
     // Create individual jobs for each bot on each day at their specific execution time
     for (const botData of schedule.bots) {
         for (const [cycleDate, daySchedule] of Object.entries(botData.schedule)) {
-            if (!daySchedule.shouldStudy || !daySchedule.executionTime || !daySchedule.executionDate) {
+            if (!daySchedule.executionTime || !daySchedule.executionDate) {
+                continue;
+            }
+
+            // Skip if bot should not study (miss behavior)
+            if (!daySchedule.shouldStudy) {
+                console.log(`  ⊘ Skipping ${botData.bot.name} for ${cycleDate} - behavior: miss`);
+                // Still update status in bot-manager DB
+                if (daySchedule.executionId) {
+                    await updateBotManagerExecutionStatus(daySchedule.executionId, 'skipped', {
+                        reason: 'Miss behavior',
+                        hours: 0
+                    });
+                }
                 continue;
             }
 
@@ -409,6 +427,7 @@ async function setupScheduleExecution(schedule) {
             const job = scheduleJob(executionDateUTC, async () => {
                 console.log(`🚀 Executing ${botData.bot.name} at ${daySchedule.executionTime} BD (${executionDateUTC.toISOString()} UTC)`);
                 console.log(`   Cycle Date (5 AM Rule): ${cycleDate}`);
+                console.log(`   Behavior: ${daySchedule.behavior || 'continue'}, Target: ${daySchedule.formatted}`);
                 await executeSingleBot(botData.bot, cycleDate, daySchedule);
             });
 
