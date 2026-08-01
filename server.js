@@ -251,119 +251,55 @@ app.delete('/api/schedules/:id', async (req, res) => {
     res.json({ success: true, message: 'Schedule deleted' });
 });
 
-// Health check
-app.get('/health', async (req, res) => {
-    try {
-        // Get execution count from database
-        const { count, error: countError } = await botManagerSupabase
-            .from('bot_manager_executions')
-            .select('*', { count: 'exact', head: true });
-
-        const executionCount = countError ? executionHistory.length : (count || 0);
-
-        res.json({
-            status: 'healthy',
-            activeSchedules: activeSchedules.length,
-            scheduledTasks: scheduledTasks.size,
-            executionHistoryCount: executionCount,
-            recovered: true // Indicate that recovery is enabled
+// Health check with more details
+app.get('/health', (req, res) => {
+    const now = new Date();
+    const upcomingTasks = [];
+    
+    // Count upcoming tasks in next 24 hours
+    scheduledTasks.forEach((tasks, scheduleId) => {
+        tasks.forEach(task => {
+            if (task.nextInvocation()) {
+                const nextTime = new Date(task.nextInvocation());
+                if (nextTime > now && nextTime < new Date(now.getTime() + 24 * 60 * 60 * 1000)) {
+                    upcomingTasks.push({
+                        scheduleId,
+                        nextExecution: nextTime.toISOString()
+                    });
+                }
+            }
         });
-    } catch (error) {
-        // Fallback to in-memory count if database fails
-        res.json({
-            status: 'healthy',
-            activeSchedules: activeSchedules.length,
-            scheduledTasks: scheduledTasks.size,
-            executionHistoryCount: executionHistory.length,
-            recovered: true
-        });
-    }
+    });
+
+    res.json({
+        status: 'healthy',
+        timestamp: now.toISOString(),
+        activeSchedules: activeSchedules.length,
+        scheduledTasks: scheduledTasks.size,
+        executionHistoryCount: executionHistory.length,
+        upcomingTasksCount: upcomingTasks.length,
+        upcomingTasks: upcomingTasks.slice(0, 10) // Show next 10 tasks
+    });
+});
+
+// Keep-alive endpoint for cron jobs
+app.get('/keep-alive', (req, res) => {
+    console.log('🔄 Keep-alive ping received at', new Date().toISOString());
+    res.json({
+        status: 'alive',
+        timestamp: new Date().toISOString(),
+        message: 'Server is running and active'
+    });
 });
 
 // Get execution history
-app.get('/api/execution-history', async (req, res) => {
+app.get('/api/execution-history', (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
-
-    try {
-        const { data: executions, error } = await botManagerSupabase
-            .from('bot_manager_executions')
-            .select('*')
-            .order('timestamp', { ascending: false })
-            .limit(limit);
-
-        if (error) throw error;
-
-        const history = executions.map(exec => ({
-            botName: exec.bot_name,
-            cycleDate: exec.cycle_date,
-            executionTime: exec.execution_time,
-            studyHours: exec.study_hours,
-            status: exec.status,
-            timestamp: exec.timestamp,
-            errorMessage: exec.error_message
-        }));
-
-        res.json({
-            total: history.length,
-            history: history
-        });
-    } catch (error) {
-        console.error('Error fetching execution history:', error);
-        // Fallback to in-memory history
-        const history = executionHistory.slice(-limit).reverse();
-        res.json({
-            total: executionHistory.length,
-            history: history
-        });
-    }
-});
-
-// Get upcoming executions
-app.get('/api/upcoming-executions', async (req, res) => {
-    try {
-        const upcoming = [];
-        const now = new Date();
-
-        activeSchedules.forEach(schedule => {
-            if (schedule.bots) {
-                schedule.bots.forEach(botSchedule => {
-                    if (botSchedule.schedule) {
-                        Object.entries(botSchedule.schedule).forEach(([date, data]) => {
-                            if (data.shouldStudy && data.executionTime && data.executionDate) {
-                                const [hours, minutes] = data.executionTime.split(':').map(Number);
-                                const executionDateTime = new Date(data.executionDate);
-                                executionDateTime.setHours(hours, minutes, 0, 0);
-                                
-                                if (executionDateTime > now) {
-                                    upcoming.push({
-                                        botName: botSchedule.bot.name,
-                                        executionTime: data.executionTime,
-                                        executionDate: data.executionDate,
-                                        studyHours: data.formatted,
-                                        executionDateTime: executionDateTime
-                                    });
-                                }
-                            }
-                        });
-                    }
-                });
-            }
-        });
-
-        // Sort by execution date/time
-        upcoming.sort((a, b) => a.executionDateTime - b.executionDateTime);
-
-        res.json({
-            total: upcoming.length,
-            upcoming: upcoming.slice(0, 20) // Limit to 20
-        });
-    } catch (error) {
-        console.error('Error fetching upcoming executions:', error);
-        res.json({
-            total: 0,
-            upcoming: []
-        });
-    }
+    const history = executionHistory.slice(-limit).reverse();
+    res.json({
+        total: executionHistory.length,
+        history: history
+    });
 });
 
 // API endpoint to fetch pending executions from bot-manager DB
@@ -509,6 +445,95 @@ app.get('/api/bot-manager/schedules', async (req, res) => {
         });
     } catch (error) {
         console.error('Error fetching schedules:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Detailed status dashboard endpoint
+app.get('/api/status-dashboard', async (req, res) => {
+    try {
+        const now = new Date();
+        const today = now.toISOString().split('T')[0];
+        
+        // Get active schedules from database
+        const { data: schedules, error: schedulesError } = await botManagerSupabase
+            .from('bot_manager_schedules')
+            .select('*')
+            .eq('status', 'active');
+        
+        if (schedulesError) throw schedulesError;
+        
+        const scheduleIds = (schedules || []).map(s => s.id);
+        
+        // Get all executions for these schedules
+        const { data: executions, error: execError } = await botManagerSupabase
+            .from('bot_manager_scheduled_executions')
+            .select('*')
+            .in('schedule_id', scheduleIds);
+        
+        if (execError) throw execError;
+        
+        // Get recent execution history
+        const { data: recentHistory, error: historyError } = await botManagerSupabase
+            .from('bot_manager_executions')
+            .select('*')
+            .order('timestamp', { ascending: false })
+            .limit(20);
+        
+        if (historyError) throw historyError;
+        
+        // Categorize executions
+        const pendingExecutions = (executions || []).filter(e => e.status === 'pending');
+        const completedExecutions = (executions || []).filter(e => e.status === 'success');
+        const failedExecutions = (executions || []).filter(e => e.status === 'failed');
+        const skippedExecutions = (executions || []).filter(e => e.status === 'skipped');
+        
+        // Count upcoming executions (next 24 hours)
+        const upcomingCount = pendingExecutions.filter(e => {
+            const execDate = new Date(e.scheduled_date);
+            return execDate > now && execDate < new Date(now.getTime() + 24 * 60 * 60 * 1000);
+        }).length;
+        
+        // Count today's executions
+        const todayExecutions = (executions || []).filter(e => e.scheduled_date === today);
+        const todayCompleted = todayExecutions.filter(e => e.status === 'success').length;
+        const todayFailed = todayExecutions.filter(e => e.status === 'failed').length;
+        
+        res.json({
+            success: true,
+            timestamp: now.toISOString(),
+            server: {
+                status: 'healthy',
+                uptime: process.uptime(),
+                activeSchedules: activeSchedules.length,
+                scheduledTasks: scheduledTasks.size,
+                memoryUsage: process.memoryUsage()
+            },
+            schedules: {
+                total: schedules?.length || 0,
+                active: schedules?.length || 0
+            },
+            executions: {
+                total: executions?.length || 0,
+                pending: pendingExecutions.length,
+                completed: completedExecutions.length,
+                failed: failedExecutions.length,
+                skipped: skippedExecutions.length,
+                upcoming: upcomingCount,
+                today: {
+                    total: todayExecutions.length,
+                    completed: todayCompleted,
+                    failed: todayFailed
+                }
+            },
+            recentHistory: recentHistory || [],
+            upcomingTasks: pendingExecutions
+                .filter(e => new Date(e.scheduled_date) > now)
+                .sort((a, b) => new Date(a.scheduled_date) - new Date(b.scheduled_date))
+                .slice(0, 10)
+        });
+    } catch (error) {
+        console.error('Error fetching status dashboard:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -716,7 +741,6 @@ async function logStudyHours(bot, cycleDate, studyMinutes, formatted) {
 app.listen(PORT, async () => {
     console.log(`🤖 Bot Scheduler Server running on port ${PORT}`);
     console.log(`📡 Ready to receive schedules`);
-    console.log(`🔄 Auto-recovery from database: ENABLED`);
     
     // Recover schedules from database on startup
     await recoverSchedulesFromDB();
