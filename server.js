@@ -304,7 +304,8 @@ app.get('/api/status-dashboard', async (req, res) => {
         const { data: schedules, error: schedulesError } = await botManagerSupabase
             .from('bot_manager_schedules')
             .select('*, bot_manager_bots(*)')
-            .order('execution_date');
+            .order('execution_date')
+            .order('execution_time');
 
         if (schedulesError) throw schedulesError;
 
@@ -317,6 +318,44 @@ app.get('/api/status-dashboard', async (req, res) => {
         const todayExecutions = schedules?.filter(s => s.execution_date === today) || [];
         const todayCompleted = todayExecutions.filter(s => s.status === 'done').length;
         const todayFailed = todayExecutions.filter(s => s.status === 'failed').length;
+
+        // Calculate upcoming tasks (next 24 hours)
+        const upcomingTasks = [];
+        const pendingSchedules = schedules?.filter(s => s.status === 'pending') || [];
+        
+        for (const schedule of pendingSchedules) {
+            const [hours, minutes] = schedule.execution_time.split(':').map(Number);
+            const executionDateBD = new Date(schedule.execution_date);
+            executionDateBD.setHours(hours, minutes, 0, 0);
+            const executionDateUTC = new Date(executionDateBD.getTime() - (TIMEZONE_OFFSET * 60 * 60 * 1000));
+            
+            const timeDiff = executionDateUTC - now;
+            const hoursDiff = Math.floor(timeDiff / (1000 * 60 * 60));
+            const minutesDiff = Math.floor((timeDiff % (1000 * 60 * 60)) / (1000 * 60));
+            
+            if (timeDiff > 0 && timeDiff < 24 * 60 * 60 * 1000) {
+                let timeString = '';
+                if (hoursDiff > 0) {
+                    timeString = `${hoursDiff}h ${minutesDiff}m`;
+                } else {
+                    timeString = `${minutesDiff}m`;
+                }
+                
+                upcomingTasks.push({
+                    id: schedule.id,
+                    botName: schedule.bot_manager_bots?.name || 'Unknown',
+                    executionDate: schedule.execution_date,
+                    executionTime: schedule.execution_time,
+                    cycleDate: schedule.cycle_date,
+                    studyMinutes: schedule.study_minutes,
+                    timeUntil: timeString,
+                    executionAt: executionDateUTC.toISOString()
+                });
+            }
+        }
+
+        // Sort by time until execution
+        upcomingTasks.sort((a, b) => new Date(a.executionAt) - new Date(b.executionAt));
 
         res.json({
             success: true,
@@ -341,7 +380,7 @@ app.get('/api/status-dashboard', async (req, res) => {
                 completed: completed,
                 failed: failed,
                 skipped: 0,
-                upcoming: 0,
+                upcoming: upcomingTasks.length,
                 today: {
                     total: todayExecutions.length,
                     completed: todayCompleted,
@@ -349,7 +388,7 @@ app.get('/api/status-dashboard', async (req, res) => {
                 }
             },
             recentHistory: executionHistory.slice(0, 10),
-            upcomingTasks: []
+            upcomingTasks: upcomingTasks.slice(0, 10)
         });
     } catch (error) {
         console.error('Error fetching status dashboard:', error);
