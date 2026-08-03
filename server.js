@@ -300,14 +300,26 @@ app.get('/api/status-dashboard', async (req, res) => {
         const now = new Date();
         const today = now.toISOString().split('T')[0];
 
-        // Get schedules from database
+        // Get schedules from database with bot details
         const { data: schedules, error: schedulesError } = await botManagerSupabase
             .from('bot_manager_schedules')
-            .select('*, bot_manager_bots(*)')
+            .select('*')
             .order('execution_date')
             .order('execution_time');
 
         if (schedulesError) throw schedulesError;
+
+        // Fetch bot details separately
+        const botIds = [...new Set(schedules?.map(s => s.bot_id) || [])];
+        const { data: bots, error: botsError } = await botManagerSupabase
+            .from('bot_manager_bots')
+            .select('*')
+            .in('id', botIds);
+
+        if (botsError) throw botsError;
+
+        // Create bot lookup map
+        const botMap = new Map(bots?.map(b => [b.id, b]) || []);
 
         const total = schedules?.length || 0;
         const pending = schedules?.filter(s => s.status === 'pending')?.length || 0;
@@ -341,9 +353,10 @@ app.get('/api/status-dashboard', async (req, res) => {
                     timeString = `${minutesDiff}m`;
                 }
                 
+                const bot = botMap.get(schedule.bot_id);
                 upcomingTasks.push({
                     id: schedule.id,
-                    botName: schedule.bot_manager_bots?.name || 'Unknown',
+                    botName: bot?.name || 'Unknown',
                     executionDate: schedule.execution_date,
                     executionTime: schedule.execution_time,
                     cycleDate: schedule.cycle_date,
